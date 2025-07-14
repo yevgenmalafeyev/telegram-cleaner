@@ -3,15 +3,19 @@
 import pkg from 'telegram';
 const { TelegramClient } = pkg;
 import { StringSession } from 'telegram/sessions/index.js';
+import { Api } from 'telegram/tl/index.js';
 import inquirer from 'inquirer';
+import autocomplete from 'inquirer-autocomplete-prompt';
 import chalk from 'chalk';
 import fs from 'fs/promises';
 
+inquirer.registerPrompt('autocomplete', autocomplete);
+
 /**
- * Configuration constants
+ * Application configuration
  */
 const CONFIG = {
-  DIALOGS_LIMIT: 200,
+  DEFAULT_DIALOGS_LIMIT: 2000,
   MESSAGES_LIMIT: 100,
   SESSION_FILE: 'telegram-session.json',
   CONFIG_FILE: 'telegram-config.json',
@@ -24,6 +28,11 @@ const CONFIG = {
     DELETE_ALL: 'delete_all',
     SHOW_FULL: 'show_full',
     BACK: 'back'
+  },
+  SPECIAL_VALUES: {
+    RELOAD: 'reload',
+    SEPARATOR: 'separator',
+    BACK: null
   }
 };
 
@@ -57,6 +66,23 @@ class Utils {
            cred1.apiHash === cred2.apiHash && 
            cred1.phoneNumber === cred2.phoneNumber;
   }
+
+  static createAutocompleteSource(choices) {
+    return (answers, input) => {
+      if (!input || input === '') {
+        return Promise.resolve(choices);
+      }
+      
+      const filtered = choices.filter(choice => {
+        if (choice.value === CONFIG.SPECIAL_VALUES.BACK || 
+            choice.value === CONFIG.SPECIAL_VALUES.RELOAD) return true;
+        if (choice.disabled) return true;
+        return choice.name.toLowerCase().includes(input.toLowerCase());
+      });
+      
+      return Promise.resolve(filtered);
+    };
+  }
 }
 
 /**
@@ -67,36 +93,27 @@ class ConfigManager {
     this.configFile = configFile;
   }
 
-  /**
-   * Load configuration from file
-   * @returns {Object} Configuration object or empty object if file doesn't exist
-   */
   async loadConfig() {
     try {
       const configData = await fs.readFile(this.configFile, 'utf8');
       return JSON.parse(configData);
     } catch (error) {
       if (error.code === 'ENOENT') {
-        // File doesn't exist, create empty config
         await this.createEmptyConfig();
         return {};
       } else {
-        // Other errors (permission, invalid JSON, etc.)
         console.error(chalk.red(`❌ Error loading config: ${error.message}`));
         return {};
       }
     }
   }
 
-  /**
-   * Create an empty configuration file
-   * @private
-   */
   async createEmptyConfig() {
     const emptyConfig = {
       apiId: null,
       apiHash: null,
-      phoneNumber: null
+      phoneNumber: null,
+      dialogsLimit: CONFIG.DEFAULT_DIALOGS_LIMIT
     };
     
     await Utils.handleAsyncOperation(
@@ -108,12 +125,11 @@ class ConfigManager {
     );
   }
 
-  /**
-   * Save configuration to file
-   * @param {Object} config - Configuration object to save
-   * @returns {boolean} True if saved successfully
-   */
   async saveConfig(config) {
+    if (!config.dialogsLimit) {
+      config.dialogsLimit = CONFIG.DEFAULT_DIALOGS_LIMIT;
+    }
+    
     const success = await Utils.handleAsyncOperation(
       async () => {
         await fs.writeFile(this.configFile, JSON.stringify(config, null, 2));
@@ -124,13 +140,12 @@ class ConfigManager {
     return success !== null;
   }
 
-  /**
-   * Check if configuration has required credentials
-   * @param {Object} config - Configuration object
-   * @returns {boolean} True if all required fields are present
-   */
   hasValidCredentials(config) {
     return config && config.apiId && config.apiHash && config.phoneNumber;
+  }
+
+  getDialogsLimit(config) {
+    return config && config.dialogsLimit ? config.dialogsLimit : CONFIG.DEFAULT_DIALOGS_LIMIT;
   }
 }
 
@@ -170,11 +185,6 @@ class AuthHandler {
     this.configManager = configManager;
   }
 
-  /**
-   * Prompt user for credentials with optional defaults
-   * @param {Object} defaults - Default values for credentials
-   * @returns {Object} User-entered credentials
-   */
   async promptCredentials(defaults = {}) {
     return await inquirer.prompt([
       {
@@ -201,10 +211,6 @@ class AuthHandler {
     ]);
   }
 
-  /**
-   * Ask user if they want to save credentials
-   * @returns {boolean} True if user wants to save
-   */
   async askSaveCredentials() {
     const { saveCredentials } = await inquirer.prompt([{
       type: 'confirm',
@@ -215,10 +221,6 @@ class AuthHandler {
     return saveCredentials;
   }
 
-  /**
-   * Ask user if they want to update credentials
-   * @returns {boolean} True if user wants to update
-   */
   async askUpdateCredentials() {
     const { updateCredentials } = await inquirer.prompt([{
       type: 'confirm',
@@ -229,20 +231,14 @@ class AuthHandler {
     return updateCredentials;
   }
 
-  /**
-   * Get credentials from user with config management
-   * @returns {Object} Final credentials to use
-   */
   async getCredentials() {
     const savedConfig = await this.configManager.loadConfig();
     const hasValidDefaults = this.configManager.hasValidCredentials(savedConfig);
 
-    // Get credentials from user
     const credentials = await this.promptCredentials(
       hasValidDefaults ? savedConfig : {}
     );
 
-    // Handle config saving/updating
     const isFirstTime = !hasValidDefaults;
     const valuesChanged = hasValidDefaults && !Utils.credentialsEqual(credentials, savedConfig);
 
@@ -305,8 +301,8 @@ class GroupManager {
     this.client = client;
   }
 
-  async getDialogs() {
-    return await this.client.getDialogs({ limit: CONFIG.DIALOGS_LIMIT });
+  async getDialogs(limit) {
+    return await this.client.getDialogs({ limit: limit || CONFIG.DEFAULT_DIALOGS_LIMIT });
   }
 
   async getMyMessageCount(dialog) {
@@ -377,177 +373,185 @@ class GroupManager {
       if (isAdmin) return 'admin';
       return 'member';
     } catch (error) {
+      // If we can't get participants (common for channels), assume member role
+      if (error.message.includes('CHAT_ADMIN_REQUIRED') || 
+          error.message.includes('CHANNEL_PRIVATE') ||
+          error.message.includes('FORBIDDEN')) {
+        return 'member';
+      }
       console.error(chalk.red('❌ Error getting user role:'), error.message);
       return 'member';
     }
   }
 
   async leaveGroup(groupEntity) {
-    await this.client.invoke({
-      _: 'channels.leaveChannel',
-      channel: groupEntity
-    });
-  }
-
-  async deleteGroup(groupEntity) {
-    const participants = await this.client.getParticipants(groupEntity);
-    const me = await this.client.getMe();
-    
-    for (const participant of participants) {
-      if (participant.userId !== me.id) {
+    try {
+      // Use the high-level client method first (most reliable)
+      await this.client.leaveChat(groupEntity);
+    } catch (error) {
+      // Fallback to manual MTProto methods
+      try {
+        if (groupEntity.className === 'Channel') {
+          await this.client.invoke(
+            new Api.channels.LeaveChannel({
+              channel: groupEntity
+            })
+          );
+        } else {
+          // For regular groups
+          const me = await this.client.getMe();
+          await this.client.invoke(
+            new Api.messages.DeleteChatUser({
+              chatId: groupEntity.id,
+              userId: me.id
+            })
+          );
+        }
+      } catch (fallbackError) {
+        // Final fallback: try LeaveChannel for any group type
         try {
-          await this.client.invoke({
-            _: 'channels.editBanned',
-            channel: groupEntity,
-            participant: participant,
-            bannedRights: {
-              _: 'chatBannedRights',
-              viewMessages: true,
-              sendMessages: true,
-              sendMedia: true,
-              sendStickers: true,
-              sendGifs: true,
-              sendGames: true,
-              sendInline: true,
-              embedLinks: true,
-              untilDate: 0
-            }
-          });
-        } catch (kickError) {
-          console.warn(chalk.yellow(`⚠️ Could not kick user: ${kickError.message}`));
+          await this.client.invoke(
+            new Api.channels.LeaveChannel({
+              channel: groupEntity
+            })
+          );
+        } catch (finalError) {
+          throw new Error(`Failed to leave group: ${error.message}. Tried multiple methods.`);
         }
       }
     }
-
-    await this.client.invoke({
-      _: 'channels.deleteChannel',
-      channel: groupEntity
-    });
-  }
-}
-
-/**
- * UI components
- */
-class UIComponents {
-  static async showMainMenu() {
-    const { feature } = await inquirer.prompt([{
-      type: 'list',
-      name: 'feature',
-      message: 'Select a feature:',
-      choices: [
-        { name: '🗑️ Manage groups where I have posted messages', value: CONFIG.MENU_OPTIONS.MANAGE_POSTED },
-        { name: '👥 Manage groups where I haven\'t posted messages', value: CONFIG.MENU_OPTIONS.MANAGE_INACTIVE },
-        { name: chalk.gray('🚪 Exit'), value: CONFIG.MENU_OPTIONS.EXIT }
-      ]
-    }]);
-    return feature;
   }
 
-  static async showGroupActions(messageCount, groupTitle) {
-    const { action } = await inquirer.prompt([{
-      type: 'list',
-      name: 'action',
-      message: 'What would you like to do?',
-      choices: [
-        { name: '🗑️ Delete all messages', value: CONFIG.GROUP_ACTIONS.DELETE_ALL },
-        { name: '📄 Show full message list', value: CONFIG.GROUP_ACTIONS.SHOW_FULL },
-        { name: '🔙 Go back', value: CONFIG.GROUP_ACTIONS.BACK }
-      ]
-    }]);
-    return action;
-  }
-
-  static async confirmDeletion(messageCount, groupTitle) {
-    const { confirm } = await inquirer.prompt([{
-      type: 'confirm',
-      name: 'confirm',
-      message: chalk.red(`Are you sure you want to delete all ${messageCount} messages from "${groupTitle}"?`),
-      default: false
-    }]);
-    return confirm;
-  }
-
-  static async askLeaveGroup(groupTitle) {
-    const { leaveGroup } = await inquirer.prompt([{
-      type: 'confirm',
-      name: 'leaveGroup',
-      message: chalk.yellow(`Would you like to leave "${groupTitle}"?`),
-      default: false
-    }]);
-    return leaveGroup;
-  }
-
-  static async confirmGroupDeletion(groupTitle) {
-    const { deleteGroup } = await inquirer.prompt([{
-      type: 'confirm',
-      name: 'deleteGroup',
-      message: chalk.red(`Would you like to kick all users and delete the group "${groupTitle}"?`),
-      default: false
-    }]);
-    return deleteGroup;
-  }
-
-  static async confirmAdminLeave(groupTitle) {
-    const { stillLeave } = await inquirer.prompt([{
-      type: 'confirm',
-      name: 'stillLeave',
-      message: chalk.yellow(`Are you sure you want to leave "${groupTitle}"? You will lose admin privileges.`),
-      default: false
-    }]);
-    return stillLeave;
-  }
-
-  static displayMessages(messages) {
-    console.log(chalk.green(`\n📋 Found ${messages.length} of your messages:`));
-    messages.forEach((msg, index) => {
-      const preview = Utils.formatMessagePreview(msg.text);
-      console.log(chalk.gray(`${index + 1}. [${msg.date}] ${preview}`));
-    });
-  }
-
-  static displayFullMessages(messages) {
-    console.log(chalk.blue('\n📋 Full message list:'));
-    messages.forEach((msg, index) => {
-      console.log(chalk.gray(`\n${index + 1}. [${msg.date}]`));
-      console.log(chalk.white(msg.text));
-      console.log(chalk.gray('─'.repeat(50)));
-    });
-  }
-}
-
-/**
- * Main application class
- */
-class TelegramCleaner {
-  constructor() {
-    this.client = null;
-    this.sessionManager = new SessionManager();
-    this.configManager = new ConfigManager();
-    this.authHandler = new AuthHandler(this.sessionManager, this.configManager);
-    this.groupManager = null;
-  }
-
-  async authenticate() {
-    console.log(chalk.blue('🔐 Telegram Authentication'));
-    
-    const credentials = await this.authHandler.getCredentials();
-    
+  async deleteGroup(groupEntity) {
     try {
-      this.client = await this.authHandler.authenticateClient(credentials);
-      this.groupManager = new GroupManager(this.client);
-      console.log(chalk.green('✅ Successfully authenticated!'));
+      const participants = await this.client.getParticipants(groupEntity);
+      const me = await this.client.getMe();
+      
+      // Step 1: Delete all messages from all users
+      console.log(chalk.blue('🗑️ Deleting all messages...'));
+      let messagesDeleted = false;
+      try {
+        // Get all messages in the group and delete them
+        let totalDeleted = 0;
+        let offsetId = 0;
+        
+        while (true) {
+          const messages = await this.client.getMessages(groupEntity, {
+            limit: 100,
+            offsetId: offsetId
+          });
+          
+          if (messages.length === 0) break;
+          
+          const messageIds = messages.map(msg => msg.id);
+          
+          try {
+            await this.client.deleteMessages(groupEntity, messageIds, { revoke: true });
+            totalDeleted += messageIds.length;
+          } catch (deleteError) {
+            console.warn(chalk.yellow(`⚠️ Could not delete some messages: ${deleteError.message}`));
+          }
+          
+          offsetId = messages[messages.length - 1].id;
+          
+          // Small delay to avoid rate limiting
+          await new Promise(resolve => setTimeout(resolve, 500));
+        }
+        
+        if (totalDeleted > 0) {
+          console.log(chalk.green(`✅ Messages deleted: ${totalDeleted}`));
+          messagesDeleted = true;
+        } else {
+          console.log(chalk.yellow(`⚠️ No messages to delete`));
+        }
+      } catch (error) {
+        console.log(chalk.red(`❌ Messages deletion failed: ${error.message}`));
+      }
+      
+      // Step 2: Kick all members except yourself
+      console.log(chalk.blue('🚫 Kicking all members...'));
+      let kickedCount = 0;
+      let membersKicked = false;
+      
+      for (const participant of participants) {
+        if (participant.userId !== me.id) {
+          try {
+            await this.client.invoke(
+              new Api.channels.EditBanned({
+                channel: groupEntity,
+                participant: participant,
+                bannedRights: new Api.ChatBannedRights({
+                  viewMessages: true,
+                  sendMessages: true,
+                  sendMedia: true,
+                  sendStickers: true,
+                  sendGifs: true,
+                  sendGames: true,
+                  sendInline: true,
+                  embedLinks: true,
+                  untilDate: 0
+                })
+              })
+            );
+            kickedCount++;
+          } catch (kickError) {
+            console.warn(chalk.yellow(`⚠️ Could not kick user: ${kickError.message}`));
+          }
+        }
+      }
+      
+      if (kickedCount > 0) {
+        console.log(chalk.green(`✅ Members kicked: ${kickedCount}`));
+        membersKicked = true;
+      } else {
+        console.log(chalk.yellow(`⚠️ No members to kick`));
+      }
+
+      // Step 3: Delete the group
+      console.log(chalk.blue('🗑️ Deleting the group...'));
+      let groupDeleted = false;
+      try {
+        await this.client.invoke(
+          new Api.channels.DeleteChannel({
+            channel: groupEntity
+          })
+        );
+        console.log(chalk.green(`✅ Group deleted successfully`));
+        groupDeleted = true;
+      } catch (error) {
+        console.log(chalk.red(`❌ Group deletion failed: ${error.message}`));
+      }
     } catch (error) {
-      console.error(chalk.red('❌ Authentication failed:'), error.message);
-      process.exit(1);
+      console.error(chalk.red(`❌ Error during group deletion: ${error.message}`));
+      throw error;
     }
   }
+}
 
-  async getGroupsWithMyMessages() {
+/**
+ * Data management for groups
+ */
+class GroupDataManager {
+  constructor(groupManager, configManager) {
+    this.groupManager = groupManager;
+    this.configManager = configManager;
+    this.cachedGroupsWithMessages = null;
+    this.cachedInactiveGroups = null;
+    this.processedGroups = new Set();
+  }
+
+  async loadGroupsWithMessages(forceReload = false) {
+    if (this.cachedGroupsWithMessages && !forceReload) {
+      return this.cachedGroupsWithMessages;
+    }
+    
     console.log(chalk.blue('🔍 Scanning for groups where you have posted messages...'));
     
+    const config = await this.configManager.loadConfig();
+    const dialogsLimit = this.configManager.getDialogsLimit(config);
+    
     const groupsWithMessages = [];
-    const dialogs = await this.groupManager.getDialogs();
+    const dialogs = await this.groupManager.getDialogs(dialogsLimit);
     
     for (const dialog of dialogs) {
       if (dialog.isGroup || dialog.isChannel) {
@@ -557,25 +561,40 @@ class TelegramCleaner {
         );
         
         if (messageCount > 0) {
+          const lastMessage = await this.groupManager.getLastMessage(dialog);
+          
           groupsWithMessages.push({
             id: dialog.id,
             title: dialog.title,
             type: dialog.isChannel ? 'Channel' : 'Group',
             messageCount: messageCount,
-            entity: dialog.entity
+            entity: dialog.entity,
+            lastMessageDate: lastMessage ? lastMessage.date : 0
           });
         }
       }
     }
 
+    this.cachedGroupsWithMessages = groupsWithMessages;
+    if (forceReload) {
+      this.processedGroups.clear();
+    }
+    
     return groupsWithMessages;
   }
 
-  async getGroupsWithoutMyMessages() {
+  async loadInactiveGroups(forceReload = false) {
+    if (this.cachedInactiveGroups && !forceReload) {
+      return this.cachedInactiveGroups;
+    }
+    
     console.log(chalk.blue('🔍 Scanning for groups where you haven\'t posted messages...'));
     
+    const config = await this.configManager.loadConfig();
+    const dialogsLimit = this.configManager.getDialogsLimit(config);
+    
     const inactiveGroups = [];
-    const dialogs = await this.groupManager.getDialogs();
+    const dialogs = await this.groupManager.getDialogs(dialogsLimit);
     
     for (const dialog of dialogs) {
       if (dialog.isGroup || dialog.isChannel) {
@@ -604,10 +623,73 @@ class TelegramCleaner {
     groups.sort((a, b) => a.lastMessageDate - b.lastMessageDate);
     channels.sort((a, b) => a.lastMessageDate - b.lastMessageDate);
 
-    return { groups, channels };
+    const result = { groups, channels };
+    this.cachedInactiveGroups = result;
+    if (forceReload) {
+      this.processedGroups.clear();
+    }
+    
+    return result;
   }
 
-  async selectGroup(groups) {
+  markGroupAsProcessed(groupId) {
+    this.processedGroups.add(groupId);
+  }
+
+  isGroupProcessed(groupId) {
+    return this.processedGroups.has(groupId);
+  }
+
+  clearProcessedGroups() {
+    this.processedGroups.clear();
+  }
+}
+
+/**
+ * UI components and interactions
+ */
+class UIManager {
+  constructor(groupDataManager) {
+    this.groupDataManager = groupDataManager;
+  }
+
+  async showMainMenu() {
+    const { feature } = await inquirer.prompt([{
+      type: 'list',
+      name: 'feature',
+      message: 'Select a feature:',
+      choices: [
+        { name: '🗑️ Manage groups where I have posted messages', value: CONFIG.MENU_OPTIONS.MANAGE_POSTED },
+        { name: '👥 Manage groups where I haven\'t posted messages', value: CONFIG.MENU_OPTIONS.MANAGE_INACTIVE },
+        { name: chalk.gray('🚪 Exit'), value: CONFIG.MENU_OPTIONS.EXIT }
+      ]
+    }]);
+    return feature;
+  }
+
+  formatGroupChoice(group, includeMessageCount = false) {
+    const lastActivity = Utils.formatDate(group.lastMessageDate);
+    const isProcessed = this.groupDataManager.isGroupProcessed(group.id);
+    const processedMarker = isProcessed ? chalk.green(' [PROCESSED]') : '';
+    
+    let displayText;
+    if (includeMessageCount) {
+      displayText = `${group.title} (${group.type}) - ${group.messageCount} messages (Last: ${lastActivity})`;
+    } else {
+      displayText = `${group.title} (Last activity: ${lastActivity})`;
+    }
+    
+    const displayName = isProcessed 
+      ? chalk.gray(`${displayText}${processedMarker}`)
+      : displayText;
+    
+    return {
+      name: displayName,
+      value: group
+    };
+  }
+
+  async selectGroupWithMessages(groups) {
     const groupsWithMessages = groups.filter(group => group.messageCount > 0);
     
     if (groupsWithMessages.length === 0) {
@@ -615,20 +697,20 @@ class TelegramCleaner {
       return null;
     }
 
-    groupsWithMessages.sort((a, b) => a.messageCount - b.messageCount);
+    groupsWithMessages.sort((a, b) => a.lastMessageDate - b.lastMessageDate);
 
-    const choices = groupsWithMessages.map(group => ({
-      name: `${group.title} (${group.type}) - ${group.messageCount} messages`,
-      value: group
-    }));
+    const choices = groupsWithMessages.map(group => 
+      this.formatGroupChoice(group, true)
+    );
 
-    choices.push({ name: chalk.gray('🔙 Back to main menu'), value: null });
+    choices.unshift({ name: chalk.blue('🔄 Reload group list'), value: CONFIG.SPECIAL_VALUES.RELOAD });
+    choices.push({ name: chalk.gray('🔙 Back to main menu'), value: CONFIG.SPECIAL_VALUES.BACK });
 
     const { selectedGroup } = await inquirer.prompt([{
-      type: 'list',
+      type: 'autocomplete',
       name: 'selectedGroup',
-      message: 'Select a group to manage your messages:',
-      choices: choices,
+      message: 'Select a group to manage your messages (type to search):',
+      source: Utils.createAutocompleteSource(choices),
       pageSize: 15
     }]);
 
@@ -644,65 +726,191 @@ class TelegramCleaner {
     }
 
     const choices = [];
+    choices.push({ name: chalk.blue('🔄 Reload group list'), value: CONFIG.SPECIAL_VALUES.RELOAD });
 
     if (groups.length > 0) {
-      choices.push({ name: chalk.bold.green('--- GROUPS ---'), value: 'separator', disabled: true });
+      choices.push({ name: chalk.bold.green('--- GROUPS ---'), value: CONFIG.SPECIAL_VALUES.SEPARATOR, disabled: true });
       groups.forEach(group => {
-        const lastActivity = Utils.formatDate(group.lastMessageDate);
-        choices.push({
-          name: `${group.title} (Last activity: ${lastActivity})`,
-          value: group
-        });
+        choices.push(this.formatGroupChoice(group, false));
       });
     }
 
     if (channels.length > 0) {
-      choices.push({ name: chalk.bold.blue('--- CHANNELS ---'), value: 'separator', disabled: true });
+      choices.push({ name: chalk.bold.blue('--- CHANNELS ---'), value: CONFIG.SPECIAL_VALUES.SEPARATOR, disabled: true });
       channels.forEach(channel => {
-        const lastActivity = Utils.formatDate(channel.lastMessageDate);
-        choices.push({
-          name: `${channel.title} (Last activity: ${lastActivity})`,
-          value: channel
-        });
+        choices.push(this.formatGroupChoice(channel, false));
       });
     }
 
-    choices.push({ name: chalk.gray('🔙 Back to main menu'), value: null });
+    choices.push({ name: chalk.gray('🔙 Back to main menu'), value: CONFIG.SPECIAL_VALUES.BACK });
 
     const { selectedGroup } = await inquirer.prompt([{
-      type: 'list',
+      type: 'autocomplete',
       name: 'selectedGroup',
-      message: `Select a group to manage (${totalCount} inactive groups):`,
-      choices: choices,
+      message: `Select a group to manage (${totalCount} inactive groups, type to search):`,
+      source: Utils.createAutocompleteSource(choices),
       pageSize: 15
     }]);
 
     return selectedGroup;
   }
 
-  async manageGroupMessages(group) {
-    console.log(chalk.blue(`\n📱 Managing messages in: ${group.title}`));
+  async showGroupActions(messageCount, groupTitle) {
+    const { action } = await inquirer.prompt([{
+      type: 'list',
+      name: 'action',
+      message: 'What would you like to do?',
+      choices: [
+        { name: '🗑️ Delete all messages', value: CONFIG.GROUP_ACTIONS.DELETE_ALL },
+        { name: '📄 Show full message list', value: CONFIG.GROUP_ACTIONS.SHOW_FULL },
+        { name: '🔙 Go back', value: CONFIG.GROUP_ACTIONS.BACK }
+      ]
+    }]);
+    return action;
+  }
+
+  async confirmDeletion(messageCount, groupTitle) {
+    const { confirm } = await inquirer.prompt([{
+      type: 'confirm',
+      name: 'confirm',
+      message: chalk.red(`Are you sure you want to delete all ${messageCount} messages from "${groupTitle}"?`),
+      default: false
+    }]);
+    return confirm;
+  }
+
+  async askLeaveGroup(groupTitle) {
+    const { leaveGroup } = await inquirer.prompt([{
+      type: 'confirm',
+      name: 'leaveGroup',
+      message: chalk.yellow(`Would you like to leave "${groupTitle}"?`),
+      default: false
+    }]);
+    return leaveGroup;
+  }
+
+  async confirmGroupDeletion(groupTitle) {
+    const { deleteGroup } = await inquirer.prompt([{
+      type: 'confirm',
+      name: 'deleteGroup',
+      message: chalk.red(`Would you like to delete ALL messages, kick all users, and delete the group "${groupTitle}"?`),
+      default: false
+    }]);
+    return deleteGroup;
+  }
+
+  async confirmAdminLeave(groupTitle) {
+    const { stillLeave } = await inquirer.prompt([{
+      type: 'confirm',
+      name: 'stillLeave',
+      message: chalk.yellow(`Are you sure you want to leave "${groupTitle}"? You will lose admin privileges.`),
+      default: false
+    }]);
+    return stillLeave;
+  }
+
+  displayMessages(messages) {
+    console.log(chalk.green(`\n📋 Found ${messages.length} of your messages:`));
+    messages.forEach((msg, index) => {
+      const preview = Utils.formatMessagePreview(msg.text);
+      console.log(chalk.gray(`${index + 1}. [${msg.date}] ${preview}`));
+    });
+  }
+
+  displayFullMessages(messages) {
+    console.log(chalk.blue('\n📋 Full message list:'));
+    messages.forEach((msg, index) => {
+      console.log(chalk.gray(`\n${index + 1}. [${msg.date}]`));
+      console.log(chalk.white(msg.text));
+      console.log(chalk.gray('─'.repeat(50)));
+    });
+  }
+}
+
+/**
+ * Main application class
+ */
+class TelegramCleaner {
+  constructor() {
+    this.client = null;
+    this.sessionManager = new SessionManager();
+    this.configManager = new ConfigManager();
+    this.authHandler = new AuthHandler(this.sessionManager, this.configManager);
+    this.groupManager = null;
+    this.groupDataManager = null;
+    this.uiManager = null;
+  }
+
+  async authenticate() {
+    console.log(chalk.blue('🔐 Telegram Authentication'));
     
-    const messages = await this.groupManager.getMyMessages(group.entity);
-
-    if (messages.length === 0) {
-      console.log(chalk.yellow('📭 No messages found in this group.'));
-      return;
-    }
-
-    UIComponents.displayMessages(messages);
-
-    const action = await UIComponents.showGroupActions(messages.length, group.title);
-
-    if (action === CONFIG.GROUP_ACTIONS.DELETE_ALL) {
-      await this.handleMessageDeletion(group, messages);
-    } else if (action === CONFIG.GROUP_ACTIONS.SHOW_FULL) {
-      await this.handleFullMessageDisplay(group, messages);
+    const credentials = await this.authHandler.getCredentials();
+    
+    try {
+      this.client = await this.authHandler.authenticateClient(credentials);
+      this.groupManager = new GroupManager(this.client);
+      this.groupDataManager = new GroupDataManager(this.groupManager, this.configManager);
+      this.uiManager = new UIManager(this.groupDataManager);
+      console.log(chalk.green('✅ Successfully authenticated!'));
+    } catch (error) {
+      console.error(chalk.red('❌ Authentication failed:'), error.message);
+      process.exit(1);
     }
   }
 
+  async handleLeaveGroup(group) {
+    const userRole = await this.groupManager.getUserRole(group.entity);
+    
+    try {
+      if (userRole === 'owner') {
+        console.log(chalk.red(`⚠️ You are the owner of "${group.title}"`));
+        console.log(chalk.blue('🗑️ Deleting all messages, kicking all users, and deleting group...'));
+        await this.groupManager.deleteGroup(group.entity);
+        console.log(chalk.green(`✅ Successfully completely deleted "${group.title}"`));
+      } else if (userRole === 'admin') {
+        console.log(chalk.yellow(`⚠️ You are an administrator of "${group.title}"`));
+        const stillLeave = await this.uiManager.confirmAdminLeave(group.title);
+
+        if (stillLeave) {
+          console.log(chalk.blue('👋 Leaving group...'));
+          await this.groupManager.leaveGroup(group.entity);
+          console.log(chalk.green(`✅ Left "${group.title}"`));
+        }
+      } else {
+        console.log(chalk.blue('👋 Leaving group...'));
+        await this.groupManager.leaveGroup(group.entity);
+        console.log(chalk.green(`✅ Left "${group.title}"`));
+      }
+    } catch (error) {
+      console.error(chalk.red('❌ Error leaving group:'), error.message);
+    }
+  }
+
+  async handlePostDeletion(group) {
+    const leaveGroup = await this.uiManager.askLeaveGroup(group.title);
+
+    if (leaveGroup) {
+      await this.handleLeaveGroup(group);
+    }
+    
+    this.groupDataManager.markGroupAsProcessed(group.id);
+  }
+
+  async handleInactiveGroup(group) {
+    const userRole = await this.groupManager.getUserRole(group.entity);
+    console.log(chalk.blue(`\n📱 Managing inactive group: ${group.title} (${group.type}) ${chalk.cyan(`[${userRole.toUpperCase()}]`)}`));
+    
+    const leaveGroup = await this.uiManager.askLeaveGroup(group.title);
+
+    if (leaveGroup) {
+      await this.handleLeaveGroup(group);
+    }
+    
+    this.groupDataManager.markGroupAsProcessed(group.id);
+  }
+
   async handleMessageDeletion(group, messages) {
-    const confirm = await UIComponents.confirmDeletion(messages.length, group.title);
+    const confirm = await this.uiManager.confirmDeletion(messages.length, group.title);
 
     if (confirm) {
       console.log(chalk.blue('🗑️ Deleting messages...'));
@@ -719,9 +927,9 @@ class TelegramCleaner {
   }
 
   async handleFullMessageDisplay(group, messages) {
-    UIComponents.displayFullMessages(messages);
+    this.uiManager.displayFullMessages(messages);
 
-    const deleteAfterShow = await UIComponents.confirmDeletion(messages.length, group.title);
+    const deleteAfterShow = await this.uiManager.confirmDeletion(messages.length, group.title);
 
     if (deleteAfterShow) {
       console.log(chalk.blue('🗑️ Deleting messages...'));
@@ -737,63 +945,44 @@ class TelegramCleaner {
     }
   }
 
-  async handlePostDeletion(group) {
-    const leaveGroup = await UIComponents.askLeaveGroup(group.title);
-
-    if (leaveGroup) {
-      const userRole = await this.groupManager.getUserRole(group.entity);
-      
-      try {
-        if (userRole === 'owner') {
-          console.log(chalk.red(`⚠️ You are the owner of "${group.title}"`));
-          const deleteGroup = await UIComponents.confirmGroupDeletion(group.title);
-
-          if (deleteGroup) {
-            console.log(chalk.blue('🚫 Kicking all users and deleting group...'));
-            await this.groupManager.deleteGroup(group.entity);
-            console.log(chalk.green(`✅ Successfully deleted "${group.title}"`));
-          } else {
-            console.log(chalk.blue('👋 Leaving group...'));
-            await this.groupManager.leaveGroup(group.entity);
-            console.log(chalk.green(`✅ Left "${group.title}"`));
-          }
-        } else if (userRole === 'admin') {
-          console.log(chalk.yellow(`⚠️ You are an administrator of "${group.title}"`));
-          const stillLeave = await UIComponents.confirmAdminLeave(group.title);
-
-          if (stillLeave) {
-            console.log(chalk.blue('👋 Leaving group...'));
-            await this.groupManager.leaveGroup(group.entity);
-            console.log(chalk.green(`✅ Left "${group.title}"`));
-          }
-        } else {
-          console.log(chalk.blue('👋 Leaving group...'));
-          await this.groupManager.leaveGroup(group.entity);
-          console.log(chalk.green(`✅ Left "${group.title}"`));
-        }
-      } catch (error) {
-        console.error(chalk.red('❌ Error leaving group:'), error.message);
-      }
-    }
-  }
-
-  async handleInactiveGroup(group) {
-    console.log(chalk.blue(`\n📱 Managing inactive group: ${group.title} (${group.type})`));
+  async manageGroupMessages(group) {
+    const userRole = await this.groupManager.getUserRole(group.entity);
+    console.log(chalk.blue(`\n📱 Managing messages in: ${group.title} ${chalk.cyan(`[${userRole.toUpperCase()}]`)}`));
     
-    const leaveGroup = await UIComponents.askLeaveGroup(group.title);
+    const messages = await this.groupManager.getMyMessages(group.entity);
 
-    if (leaveGroup) {
-      await this.handlePostDeletion(group);
+    if (messages.length === 0) {
+      console.log(chalk.yellow('📭 No messages found in this group.'));
+      this.groupDataManager.markGroupAsProcessed(group.id);
+      return;
+    }
+
+    this.uiManager.displayMessages(messages);
+
+    const action = await this.uiManager.showGroupActions(messages.length, group.title);
+
+    if (action === CONFIG.GROUP_ACTIONS.DELETE_ALL) {
+      await this.handleMessageDeletion(group, messages);
+    } else if (action === CONFIG.GROUP_ACTIONS.SHOW_FULL) {
+      await this.handleFullMessageDisplay(group, messages);
+    } else if (action === CONFIG.GROUP_ACTIONS.BACK) {
+      this.groupDataManager.markGroupAsProcessed(group.id);
     }
   }
 
   async managePostedMessages() {
     while (true) {
-      const groups = await this.getGroupsWithMyMessages();
-      const selectedGroup = await this.selectGroup(groups);
+      const groups = await this.groupDataManager.loadGroupsWithMessages();
+      const selectedGroup = await this.uiManager.selectGroupWithMessages(groups);
 
       if (!selectedGroup) {
         break;
+      }
+
+      if (selectedGroup === CONFIG.SPECIAL_VALUES.RELOAD) {
+        console.log(chalk.blue('🔄 Reloading group list...'));
+        await this.groupDataManager.loadGroupsWithMessages(true);
+        continue;
       }
 
       await this.manageGroupMessages(selectedGroup);
@@ -802,11 +991,17 @@ class TelegramCleaner {
 
   async manageInactiveGroups() {
     while (true) {
-      const { groups, channels } = await this.getGroupsWithoutMyMessages();
-      const selectedGroup = await this.selectInactiveGroup(groups, channels);
+      const { groups, channels } = await this.groupDataManager.loadInactiveGroups();
+      const selectedGroup = await this.uiManager.selectInactiveGroup(groups, channels);
 
       if (!selectedGroup) {
         break;
+      }
+
+      if (selectedGroup === CONFIG.SPECIAL_VALUES.RELOAD) {
+        console.log(chalk.blue('🔄 Reloading group list...'));
+        await this.groupDataManager.loadInactiveGroups(true);
+        continue;
       }
 
       await this.handleInactiveGroup(selectedGroup);
@@ -819,7 +1014,7 @@ class TelegramCleaner {
     await this.authenticate();
 
     while (true) {
-      const feature = await UIComponents.showMainMenu();
+      const feature = await this.uiManager.showMainMenu();
 
       if (feature === CONFIG.MENU_OPTIONS.EXIT) {
         console.log(chalk.blue('👋 Goodbye!'));
