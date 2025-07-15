@@ -17,6 +17,10 @@ inquirer.registerPrompt('autocomplete', autocomplete);
 const CONFIG = {
   DEFAULT_DIALOGS_LIMIT: 2000,
   MESSAGES_LIMIT: 100,
+  PARTICIPANTS_LIMIT: 16,
+  DISPLAY_MEMBERS_LIMIT: 15,
+  MESSAGE_PREVIEW_LENGTH: 50,
+  RATE_LIMIT_DELAY: 500,
   SESSION_FILE: 'telegram-session.json',
   CONFIG_FILE: 'telegram-config.json',
   MENU_OPTIONS: {
@@ -33,18 +37,34 @@ const CONFIG = {
     RELOAD: 'reload',
     SEPARATOR: 'separator',
     BACK: null
+  },
+  USER_ROLES: {
+    OWNER: 'owner',
+    ADMIN: 'admin',
+    MEMBER: 'member'
+  },
+  ROLE_CLASSES: {
+    CHANNEL_CREATOR: 'ChannelParticipantCreator',
+    CHAT_CREATOR: 'ChatParticipantCreator',
+    CHANNEL_ADMIN: 'ChannelParticipantAdmin',
+    CHAT_ADMIN: 'ChatParticipantAdmin'
+  },
+  ERROR_MESSAGES: {
+    ADMIN_REQUIRED: 'CHAT_ADMIN_REQUIRED',
+    CHANNEL_PRIVATE: 'CHANNEL_PRIVATE',
+    FORBIDDEN: 'FORBIDDEN'
   }
 };
 
 /**
- * Utility functions
+ * Utility functions for common operations
  */
 class Utils {
   static formatDate(timestamp) {
     return timestamp ? new Date(timestamp * 1000).toLocaleDateString() : 'No activity';
   }
 
-  static formatMessagePreview(text, maxLength = 50) {
+  static formatMessagePreview(text, maxLength = CONFIG.MESSAGE_PREVIEW_LENGTH) {
     return text.length > maxLength ? text.substring(0, maxLength) + '...' : text;
   }
 
@@ -86,6 +106,106 @@ class Utils {
 }
 
 /**
+ * Role management for users and participants
+ * Handles role detection, formatting, and role-based logic
+ */
+class RoleManager {
+  /**
+   * Determines user role from participant object
+   * @param {Object} participant - Telegram participant object
+   * @returns {string} Role: 'owner', 'admin', or 'member'
+   */
+  static getUserRoleFromParticipant(participant) {
+    if (!participant) return CONFIG.USER_ROLES.MEMBER;
+    
+    const className = participant.className;
+    
+    if (className === CONFIG.ROLE_CLASSES.CHANNEL_CREATOR || 
+        className === CONFIG.ROLE_CLASSES.CHAT_CREATOR) {
+      return CONFIG.USER_ROLES.OWNER;
+    }
+    if (className === CONFIG.ROLE_CLASSES.CHANNEL_ADMIN || 
+        className === CONFIG.ROLE_CLASSES.CHAT_ADMIN) {
+      return CONFIG.USER_ROLES.ADMIN;
+    }
+    
+    return CONFIG.USER_ROLES.MEMBER;
+  }
+
+  /**
+   * Formats user display name with role badge
+   * @param {Object} user - User object with name properties
+   * @param {string} role - User role
+   * @returns {string} Formatted display name with colored role badge
+   */
+  static formatUserDisplayName(user, role = CONFIG.USER_ROLES.MEMBER) {
+    let displayName = user.firstName || '';
+    if (user.lastName) displayName += ` ${user.lastName}`;
+    if (user.username) displayName += ` (@${user.username})`;
+    if (!displayName.trim()) displayName = `User ${user.id}`;
+    
+    const roleDisplay = this.getRoleDisplay(role);
+    return `${displayName} ${roleDisplay}`;
+  }
+
+  static getRoleDisplay(role) {
+    switch (role) {
+      case CONFIG.USER_ROLES.OWNER:
+        return chalk.red('[OWNER]');
+      case CONFIG.USER_ROLES.ADMIN:
+        return chalk.yellow('[ADMIN]');
+      case CONFIG.USER_ROLES.MEMBER:
+        return chalk.gray('[MEMBER]');
+      default:
+        return chalk.gray('[MEMBER]');
+    }
+  }
+
+  static isOwner(role) {
+    return role === CONFIG.USER_ROLES.OWNER;
+  }
+
+  static isAdmin(role) {
+    return role === CONFIG.USER_ROLES.ADMIN;
+  }
+
+  static isMember(role) {
+    return role === CONFIG.USER_ROLES.MEMBER;
+  }
+}
+
+/**
+ * Centralized logging utilities with consistent formatting
+ * Provides color-coded logging methods for different message types
+ */
+class Logger {
+  static success(message) {
+    console.log(chalk.green(`✅ ${message}`));
+  }
+
+  static error(message, error = null) {
+    const errorText = error ? `: ${error.message || error}` : '';
+    console.error(chalk.red(`❌ ${message}${errorText}`));
+  }
+
+  static warning(message) {
+    console.log(chalk.yellow(`⚠️ ${message}`));
+  }
+
+  static info(message) {
+    console.log(chalk.blue(`ℹ️ ${message}`));
+  }
+
+  static progress(message) {
+    console.log(chalk.blue(`🔄 ${message}`));
+  }
+
+  static action(message) {
+    console.log(chalk.blue(`🗑️ ${message}`));
+  }
+}
+
+/**
  * Configuration management
  */
 class ConfigManager {
@@ -119,7 +239,7 @@ class ConfigManager {
     await Utils.handleAsyncOperation(
       async () => {
         await fs.writeFile(this.configFile, JSON.stringify(emptyConfig, null, 2));
-        console.log(chalk.blue(`📄 Created config file: ${this.configFile}`));
+        Logger.info(`Created config file: ${this.configFile}`);
       },
       'Error creating config file'
     );
@@ -246,14 +366,14 @@ class AuthHandler {
       if (await this.askSaveCredentials()) {
         const success = await this.configManager.saveConfig(credentials);
         if (success) {
-          console.log(chalk.green('✅ Credentials saved!'));
+          Logger.success('Credentials saved!');
         }
       }
     } else if (valuesChanged) {
       if (await this.askUpdateCredentials()) {
         const success = await this.configManager.saveConfig(credentials);
         if (success) {
-          console.log(chalk.green('✅ Credentials updated!'));
+          Logger.success('Credentials updated!');
         }
       }
     }
@@ -295,6 +415,7 @@ class AuthHandler {
 
 /**
  * Group management operations
+ * Handles Telegram API interactions for groups, messages, and participants
  */
 class GroupManager {
   constructor(client) {
@@ -356,34 +477,114 @@ class GroupManager {
     }
   }
 
-  async getUserRole(groupEntity) {
+  async getParticipants(groupEntity, limit = null) {
     try {
-      const me = await this.client.getMe();
-      const participants = await this.client.getParticipants(groupEntity);
-      const myParticipant = participants.find(p => p.userId === me.id);
-
-      if (!myParticipant) return 'member';
-
-      const isOwner = myParticipant.className === 'ChannelParticipantCreator' || 
-                     myParticipant.className === 'ChatParticipantCreator';
-      const isAdmin = myParticipant.className === 'ChannelParticipantAdmin' || 
-                     myParticipant.className === 'ChatParticipantAdmin';
-
-      if (isOwner) return 'owner';
-      if (isAdmin) return 'admin';
-      return 'member';
+      const options = limit ? { limit } : {};
+      return await this.client.getParticipants(groupEntity, options);
     } catch (error) {
-      // If we can't get participants (common for channels), assume member role
-      if (error.message.includes('CHAT_ADMIN_REQUIRED') || 
-          error.message.includes('CHANNEL_PRIVATE') ||
-          error.message.includes('FORBIDDEN')) {
-        return 'member';
+      if (error.message.includes(CONFIG.ERROR_MESSAGES.ADMIN_REQUIRED) || 
+          error.message.includes(CONFIG.ERROR_MESSAGES.CHANNEL_PRIVATE) ||
+          error.message.includes(CONFIG.ERROR_MESSAGES.FORBIDDEN)) {
+        return [];
       }
-      console.error(chalk.red('❌ Error getting user role:'), error.message);
-      return 'member';
+      throw error;
     }
   }
 
+  /**
+   * Gets the current user's role in a group
+   * @param {Object} groupEntity - Telegram group entity
+   * @returns {Promise<string>} User role: 'owner', 'admin', or 'member'
+   */
+  async getUserRole(groupEntity) {
+    try {
+      const me = await this.client.getMe();
+      
+      // Check if it's a regular chat or channel
+      const isChannel = groupEntity.className === 'Channel';
+      
+      if (isChannel) {
+        // For channels/supergroups, try the direct API method
+        try {
+          const result = await this.client.invoke(
+            new Api.channels.GetParticipant({
+              channel: groupEntity,
+              participant: me.id
+            })
+          );
+          
+          if (result.participant) {
+            return RoleManager.getUserRoleFromParticipant(result.participant);
+          }
+        } catch (directError) {
+          // Fallback to getParticipants method
+        }
+      }
+
+      // For regular chats, use the raw API method
+      let participants = [];
+      let myParticipant = null;
+      
+      if (!isChannel) {
+        try {
+          const chatFull = await this.client.invoke(
+            new Api.messages.GetFullChat({
+              chatId: groupEntity.id
+            })
+          );
+          
+          if (chatFull.fullChat && chatFull.fullChat.participants) {
+            // Check if selfParticipant exists
+            if (chatFull.fullChat.participants.selfParticipant) {
+              myParticipant = chatFull.fullChat.participants.selfParticipant;
+            }
+            
+            // Also try the participants array if it exists
+            const chatParticipants = chatFull.fullChat.participants.participants || [];
+            
+            if (chatParticipants.length > 0) {
+              // Always check the participants array, not just when myParticipant is null
+              const foundParticipant = chatParticipants.find(p => {
+                // Compare using .toString() for object comparison
+                return p.userId.toString() === me.id.toString();
+              });
+              
+              if (foundParticipant) {
+                myParticipant = foundParticipant;
+              }
+            }
+          }
+        } catch (rawError) {
+          // Fallback to getParticipants method
+        }
+      }
+      
+      // Fallback to getParticipants for channels or if raw API failed
+      if (!myParticipant) {
+        participants = await this.client.getParticipants(groupEntity, {});
+        
+        if (participants.length > 0) {
+          myParticipant = participants.find(p => p.userId === me.id) ||
+                          participants.find(p => p.id === me.id) ||
+                          participants.find(p => p.user && p.user.id === me.id);
+        }
+      }
+
+      if (!myParticipant) {
+        return CONFIG.USER_ROLES.MEMBER;
+      }
+      
+      return RoleManager.getUserRoleFromParticipant(myParticipant);
+    } catch (error) {
+      console.error(chalk.red('❌ Error getting user role:'), error.message);
+      return CONFIG.USER_ROLES.MEMBER;
+    }
+  }
+
+  /**
+   * Leaves a group with multiple fallback methods
+   * @param {Object} groupEntity - Telegram group entity
+   */
   async leaveGroup(groupEntity) {
     try {
       // Use the high-level client method first (most reliable)
@@ -420,62 +621,71 @@ class GroupManager {
         }
       }
     }
+
+    // Delete the chat history to make it disappear from chat list
+    try {
+      await this.client.invoke(
+        new Api.messages.DeleteHistory({
+          peer: groupEntity,
+          maxId: 0,
+          justClear: false,
+          revoke: false
+        })
+      );
+    } catch (historyError) {
+      console.warn(chalk.yellow(`⚠️ Could not delete chat history: ${historyError.message}`));
+    }
   }
 
-  async deleteGroup(groupEntity) {
-    try {
-      const participants = await this.client.getParticipants(groupEntity);
-      const me = await this.client.getMe();
+  async deleteAllMessages(groupEntity) {
+    Logger.action('Deleting all messages...');
+    let totalDeleted = 0;
+    let offsetId = 0;
+    
+    while (true) {
+      const messages = await this.client.getMessages(groupEntity, {
+        limit: 100,
+        offsetId: offsetId
+      });
       
-      // Step 1: Delete all messages from all users
-      console.log(chalk.blue('🗑️ Deleting all messages...'));
-      let messagesDeleted = false;
+      if (messages.length === 0) break;
+      
+      const messageIds = messages.map(msg => msg.id);
+      
       try {
-        // Get all messages in the group and delete them
-        let totalDeleted = 0;
-        let offsetId = 0;
-        
-        while (true) {
-          const messages = await this.client.getMessages(groupEntity, {
-            limit: 100,
-            offsetId: offsetId
-          });
-          
-          if (messages.length === 0) break;
-          
-          const messageIds = messages.map(msg => msg.id);
-          
-          try {
-            await this.client.deleteMessages(groupEntity, messageIds, { revoke: true });
-            totalDeleted += messageIds.length;
-          } catch (deleteError) {
-            console.warn(chalk.yellow(`⚠️ Could not delete some messages: ${deleteError.message}`));
-          }
-          
-          offsetId = messages[messages.length - 1].id;
-          
-          // Small delay to avoid rate limiting
-          await new Promise(resolve => setTimeout(resolve, 500));
-        }
-        
-        if (totalDeleted > 0) {
-          console.log(chalk.green(`✅ Messages deleted: ${totalDeleted}`));
-          messagesDeleted = true;
-        } else {
-          console.log(chalk.yellow(`⚠️ No messages to delete`));
-        }
-      } catch (error) {
-        console.log(chalk.red(`❌ Messages deletion failed: ${error.message}`));
+        await this.client.deleteMessages(groupEntity, messageIds, { revoke: true });
+        totalDeleted += messageIds.length;
+      } catch (deleteError) {
+        console.warn(chalk.yellow(`⚠️ Could not delete some messages: ${deleteError.message}`));
       }
       
-      // Step 2: Kick all members except yourself
-      console.log(chalk.blue('🚫 Kicking all members...'));
-      let kickedCount = 0;
-      let membersKicked = false;
+      offsetId = messages[messages.length - 1].id;
       
-      for (const participant of participants) {
-        if (participant.userId !== me.id) {
-          try {
+      // Small delay to avoid rate limiting
+      await new Promise(resolve => setTimeout(resolve, CONFIG.RATE_LIMIT_DELAY));
+    }
+    
+    if (totalDeleted > 0) {
+      Logger.success(`Messages deleted: ${totalDeleted}`);
+    } else {
+      Logger.warning('No messages to delete');
+    }
+    
+    return totalDeleted;
+  }
+
+  async kickAllMembers(groupEntity) {
+    Logger.action('Kicking all members...');
+    const participants = await this.getParticipants(groupEntity);
+    const me = await this.client.getMe();
+    const isChannel = groupEntity.className === 'Channel';
+    let kickedCount = 0;
+    
+    for (const participant of participants) {
+      if (participant.userId !== me.id) {
+        try {
+          if (isChannel) {
+            // For channels/supergroups
             await this.client.invoke(
               new Api.channels.EditBanned({
                 channel: groupEntity,
@@ -493,34 +703,74 @@ class GroupManager {
                 })
               })
             );
-            kickedCount++;
-          } catch (kickError) {
-            console.warn(chalk.yellow(`⚠️ Could not kick user: ${kickError.message}`));
+          } else {
+            // For regular group chats
+            await this.client.invoke(
+              new Api.messages.DeleteChatUser({
+                chatId: groupEntity.id,
+                userId: participant.userId
+              })
+            );
           }
+          kickedCount++;
+        } catch (kickError) {
+          console.warn(chalk.yellow(`⚠️ Could not kick user: ${kickError.message}`));
         }
       }
-      
-      if (kickedCount > 0) {
-        console.log(chalk.green(`✅ Members kicked: ${kickedCount}`));
-        membersKicked = true;
-      } else {
-        console.log(chalk.yellow(`⚠️ No members to kick`));
-      }
+    }
+    
+    if (kickedCount > 0) {
+      Logger.success(`Members kicked: ${kickedCount}`);
+    } else {
+      Logger.warning('No members to kick');
+    }
+    
+    return kickedCount;
+  }
 
-      // Step 3: Delete the group
-      console.log(chalk.blue('🗑️ Deleting the group...'));
-      let groupDeleted = false;
-      try {
+  async deleteChannelGroup(groupEntity) {
+    Logger.action('Deleting the group...');
+    
+    const isChannel = groupEntity.className === 'Channel';
+    
+    try {
+      if (isChannel) {
+        // For channels/supergroups
         await this.client.invoke(
           new Api.channels.DeleteChannel({
             channel: groupEntity
           })
         );
-        console.log(chalk.green(`✅ Group deleted successfully`));
-        groupDeleted = true;
-      } catch (error) {
-        console.log(chalk.red(`❌ Group deletion failed: ${error.message}`));
+      } else {
+        // For regular group chats
+        await this.client.invoke(
+          new Api.messages.DeleteChat({
+            chatId: groupEntity.id
+          })
+        );
       }
+      Logger.success('Group deleted successfully');
+      return true;
+    } catch (error) {
+      Logger.error('Group deletion failed', error);
+      return false;
+    }
+  }
+
+  /**
+   * Completely deletes a group (messages, members, group itself)
+   * @param {Object} groupEntity - Telegram group entity
+   */
+  async deleteGroup(groupEntity) {
+    try {
+      // Step 1: Delete all messages from all users
+      await this.deleteAllMessages(groupEntity);
+      
+      // Step 2: Kick all members except yourself
+      await this.kickAllMembers(groupEntity);
+
+      // Step 3: Delete the group
+      await this.deleteChannelGroup(groupEntity);
     } catch (error) {
       console.error(chalk.red(`❌ Error during group deletion: ${error.message}`));
       throw error;
@@ -545,7 +795,7 @@ class GroupDataManager {
       return this.cachedGroupsWithMessages;
     }
     
-    console.log(chalk.blue('🔍 Scanning for groups where you have posted messages...'));
+    Logger.progress('Scanning for groups where you have posted messages...');
     
     const config = await this.configManager.loadConfig();
     const dialogsLimit = this.configManager.getDialogsLimit(config);
@@ -588,7 +838,7 @@ class GroupDataManager {
       return this.cachedInactiveGroups;
     }
     
-    console.log(chalk.blue('🔍 Scanning for groups where you haven\'t posted messages...'));
+    Logger.progress('Scanning for groups where you haven\'t posted messages...');
     
     const config = await this.configManager.loadConfig();
     const dialogsLimit = this.configManager.getDialogsLimit(config);
@@ -803,7 +1053,7 @@ class UIManager {
     const { stillLeave } = await inquirer.prompt([{
       type: 'confirm',
       name: 'stillLeave',
-      message: chalk.yellow(`Are you sure you want to leave "${groupTitle}"? You will lose admin privileges.`),
+      message: chalk.red(`Are you sure you want to delete ALL messages, kick all users, and delete the group "${groupTitle}"?`),
       default: false
     }]);
     return stillLeave;
@@ -858,28 +1108,40 @@ class TelegramCleaner {
     }
   }
 
+  async handleOwnerLeave(group) {
+    console.log(chalk.red(`⚠️ You are the owner of "${group.title}"`));
+    console.log(chalk.blue('🗑️ Deleting all messages, kicking all users, and deleting group...'));
+    await this.groupManager.deleteGroup(group.entity);
+    console.log(chalk.green(`✅ Successfully completely deleted "${group.title}"`));
+  }
+
+  async handleAdminLeave(group) {
+    console.log(chalk.yellow(`⚠️ You are an administrator of "${group.title}"`));
+    const stillLeave = await this.uiManager.confirmAdminLeave(group.title);
+
+    if (stillLeave) {
+      console.log(chalk.blue('🗑️ Deleting all messages, kicking all users, and deleting group...'));
+      await this.groupManager.deleteGroup(group.entity);
+      console.log(chalk.green(`✅ Successfully completely deleted "${group.title}"`));
+    }
+  }
+
+  async handleMemberLeave(group) {
+    console.log(chalk.blue('👋 Leaving group...'));
+    await this.groupManager.leaveGroup(group.entity);
+    console.log(chalk.green(`✅ Left "${group.title}"`));
+  }
+
   async handleLeaveGroup(group) {
     const userRole = await this.groupManager.getUserRole(group.entity);
     
     try {
-      if (userRole === 'owner') {
-        console.log(chalk.red(`⚠️ You are the owner of "${group.title}"`));
-        console.log(chalk.blue('🗑️ Deleting all messages, kicking all users, and deleting group...'));
-        await this.groupManager.deleteGroup(group.entity);
-        console.log(chalk.green(`✅ Successfully completely deleted "${group.title}"`));
-      } else if (userRole === 'admin') {
-        console.log(chalk.yellow(`⚠️ You are an administrator of "${group.title}"`));
-        const stillLeave = await this.uiManager.confirmAdminLeave(group.title);
-
-        if (stillLeave) {
-          console.log(chalk.blue('👋 Leaving group...'));
-          await this.groupManager.leaveGroup(group.entity);
-          console.log(chalk.green(`✅ Left "${group.title}"`));
-        }
+      if (RoleManager.isOwner(userRole)) {
+        await this.handleOwnerLeave(group);
+      } else if (RoleManager.isAdmin(userRole)) {
+        await this.handleAdminLeave(group);
       } else {
-        console.log(chalk.blue('👋 Leaving group...'));
-        await this.groupManager.leaveGroup(group.entity);
-        console.log(chalk.green(`✅ Left "${group.title}"`));
+        await this.handleMemberLeave(group);
       }
     } catch (error) {
       console.error(chalk.red('❌ Error leaving group:'), error.message);
@@ -896,9 +1158,50 @@ class TelegramCleaner {
     this.groupDataManager.markGroupAsProcessed(group.id);
   }
 
+  async displayGroupMembers(groupEntity) {
+    try {
+      const participants = await this.groupManager.getParticipants(groupEntity, CONFIG.PARTICIPANTS_LIMIT);
+      
+      if (participants.length === 0) {
+        console.log(chalk.yellow('👥 No members found in this group.'));
+        return;
+      }
+
+      const displayCount = Math.min(participants.length, CONFIG.DISPLAY_MEMBERS_LIMIT);
+      const hasMore = participants.length > CONFIG.DISPLAY_MEMBERS_LIMIT;
+      
+      console.log(chalk.blue(`\n👥 Group members${hasMore ? ` (showing first ${displayCount} of ${participants.length > CONFIG.DISPLAY_MEMBERS_LIMIT ? '15+' : participants.length})` : ` (${participants.length}):`}`));
+      
+      for (let i = 0; i < displayCount; i++) {
+        const participant = participants[i];
+        const user = participant.user || participant;
+        const role = RoleManager.getUserRoleFromParticipant(participant);
+        const displayName = RoleManager.formatUserDisplayName(user, role);
+        
+        console.log(chalk.gray(`  ${i + 1}. ${displayName}`));
+      }
+      
+      if (hasMore) {
+        console.log(chalk.yellow(`  ... and more members`));
+      }
+    } catch (error) {
+      if (error.message.includes(CONFIG.ERROR_MESSAGES.ADMIN_REQUIRED) || 
+          error.message.includes(CONFIG.ERROR_MESSAGES.CHANNEL_PRIVATE) ||
+          error.message.includes(CONFIG.ERROR_MESSAGES.FORBIDDEN)) {
+        console.log(chalk.yellow('👥 Cannot view member list (insufficient permissions)'));
+      } else {
+        console.log(chalk.red(`❌ Error getting members: ${error.message}`));
+      }
+    }
+  }
+
+
   async handleInactiveGroup(group) {
     const userRole = await this.groupManager.getUserRole(group.entity);
     console.log(chalk.blue(`\n📱 Managing inactive group: ${group.title} (${group.type}) ${chalk.cyan(`[${userRole.toUpperCase()}]`)}`));
+    
+    // Show group members
+    await this.displayGroupMembers(group.entity);
     
     const leaveGroup = await this.uiManager.askLeaveGroup(group.title);
 
@@ -909,20 +1212,24 @@ class TelegramCleaner {
     this.groupDataManager.markGroupAsProcessed(group.id);
   }
 
+  async deleteUserMessages(group, messages) {
+    console.log(chalk.blue('🗑️ Deleting messages...'));
+    const messageIds = messages.map(msg => msg.messageObj.id);
+    const success = await this.groupManager.deleteMessages(group.entity, messageIds);
+    
+    if (success) {
+      console.log(chalk.green(`✅ Successfully deleted ${messages.length} messages!`));
+      await this.handlePostDeletion(group);
+    } else {
+      console.log(chalk.red('❌ Failed to delete some messages.'));
+    }
+  }
+
   async handleMessageDeletion(group, messages) {
     const confirm = await this.uiManager.confirmDeletion(messages.length, group.title);
 
     if (confirm) {
-      console.log(chalk.blue('🗑️ Deleting messages...'));
-      const messageIds = messages.map(msg => msg.messageObj.id);
-      const success = await this.groupManager.deleteMessages(group.entity, messageIds);
-      
-      if (success) {
-        console.log(chalk.green(`✅ Successfully deleted ${messages.length} messages!`));
-        await this.handlePostDeletion(group);
-      } else {
-        console.log(chalk.red('❌ Failed to delete some messages.'));
-      }
+      await this.deleteUserMessages(group, messages);
     }
   }
 
@@ -932,16 +1239,7 @@ class TelegramCleaner {
     const deleteAfterShow = await this.uiManager.confirmDeletion(messages.length, group.title);
 
     if (deleteAfterShow) {
-      console.log(chalk.blue('🗑️ Deleting messages...'));
-      const messageIds = messages.map(msg => msg.messageObj.id);
-      const success = await this.groupManager.deleteMessages(group.entity, messageIds);
-      
-      if (success) {
-        console.log(chalk.green(`✅ Successfully deleted ${messages.length} messages!`));
-        await this.handlePostDeletion(group);
-      } else {
-        console.log(chalk.red('❌ Failed to delete some messages.'));
-      }
+      await this.deleteUserMessages(group, messages);
     }
   }
 
@@ -957,7 +1255,10 @@ class TelegramCleaner {
       return;
     }
 
-    this.uiManager.displayMessages(messages);
+    console.log(chalk.green(`📋 Found ${messages.length} of your messages in this group.`));
+
+    // Show group members
+    await this.displayGroupMembers(group.entity);
 
     const action = await this.uiManager.showGroupActions(messages.length, group.title);
 
