@@ -118,15 +118,32 @@ class RoleManager {
   static getUserRoleFromParticipant(participant) {
     if (!participant) return CONFIG.USER_ROLES.MEMBER;
     
-    const className = participant.className;
+    // Check multiple possible className fields
+    const className = participant.className || participant.constructor?.name || participant._?.className;
     
+    // Also check for specific Telegram MTProto class names
     if (className === CONFIG.ROLE_CLASSES.CHANNEL_CREATOR || 
-        className === CONFIG.ROLE_CLASSES.CHAT_CREATOR) {
+        className === CONFIG.ROLE_CLASSES.CHAT_CREATOR ||
+        className === 'ChannelParticipantCreator' ||
+        className === 'ChatParticipantCreator') {
       return CONFIG.USER_ROLES.OWNER;
     }
+    
     if (className === CONFIG.ROLE_CLASSES.CHANNEL_ADMIN || 
-        className === CONFIG.ROLE_CLASSES.CHAT_ADMIN) {
+        className === CONFIG.ROLE_CLASSES.CHAT_ADMIN ||
+        className === 'ChannelParticipantAdmin' ||
+        className === 'ChatParticipantAdmin') {
       return CONFIG.USER_ROLES.ADMIN;
+    }
+    
+    // Additional check for type field that Telegram API sometimes uses
+    if (participant.type) {
+      if (participant.type === 'creator' || participant.type === 'owner') {
+        return CONFIG.USER_ROLES.OWNER;
+      }
+      if (participant.type === 'admin' || participant.type === 'administrator') {
+        return CONFIG.USER_ROLES.ADMIN;
+      }
     }
     
     return CONFIG.USER_ROLES.MEMBER;
@@ -492,6 +509,69 @@ class GroupManager {
   }
 
   /**
+   * Gets participants with their role information
+   * @param {Object} groupEntity - Telegram group entity
+   * @param {number} limit - Optional limit
+   * @returns {Promise<Array>} Array of participants with role info
+   */
+  async getParticipantsWithRoles(groupEntity, limit = null) {
+    try {
+      const isChannel = groupEntity.className === 'Channel';
+      
+      if (isChannel) {
+        // For channels/supergroups, use getParticipants which should return role info
+        const options = limit ? { limit } : {};
+        return await this.client.getParticipants(groupEntity, options);
+      } else {
+        // For regular chats, use GetFullChat to get participant objects with roles
+        try {
+          const chatFull = await this.client.invoke(
+            new Api.messages.GetFullChat({
+              chatId: groupEntity.id
+            })
+          );
+          
+          if (chatFull.fullChat && chatFull.fullChat.participants) {
+            const participants = chatFull.fullChat.participants.participants || [];
+            const users = chatFull.users || [];
+            
+            // Create a user lookup map
+            const userMap = new Map();
+            users.forEach(user => {
+              const userId = typeof user.id === 'bigint' ? user.id.toString() : String(user.id);
+              userMap.set(userId, user);
+            });
+            
+            // Attach user objects to participants
+            return participants.map(participant => {
+              const userId = typeof participant.userId === 'bigint' ? participant.userId.toString() : String(participant.userId);
+              const user = userMap.get(userId);
+              return {
+                ...participant,
+                user: user
+              };
+            }).slice(0, limit || participants.length);
+          }
+        } catch (rawError) {
+          console.log(chalk.yellow(`⚠️ GetFullChat failed, falling back to regular getParticipants: ${rawError.message}`));
+          // Fallback to regular getParticipants
+          const options = limit ? { limit } : {};
+          return await this.client.getParticipants(groupEntity, options);
+        }
+      }
+      
+      return [];
+    } catch (error) {
+      if (error.message.includes(CONFIG.ERROR_MESSAGES.ADMIN_REQUIRED) || 
+          error.message.includes(CONFIG.ERROR_MESSAGES.CHANNEL_PRIVATE) ||
+          error.message.includes(CONFIG.ERROR_MESSAGES.FORBIDDEN)) {
+        return [];
+      }
+      throw error;
+    }
+  }
+
+  /**
    * Gets the current user's role in a group
    * @param {Object} groupEntity - Telegram group entity
    * @returns {Promise<string>} User role: 'owner', 'admin', or 'member'
@@ -534,24 +614,30 @@ class GroupManager {
           );
           
           if (chatFull.fullChat && chatFull.fullChat.participants) {
-            // Check if selfParticipant exists
-            if (chatFull.fullChat.participants.selfParticipant) {
-              myParticipant = chatFull.fullChat.participants.selfParticipant;
-            }
-            
-            // Also try the participants array if it exists
+            // Always use the participants array to get proper role information
             const chatParticipants = chatFull.fullChat.participants.participants || [];
             
             if (chatParticipants.length > 0) {
-              // Always check the participants array, not just when myParticipant is null
               const foundParticipant = chatParticipants.find(p => {
-                // Compare using .toString() for object comparison
-                return p.userId.toString() === me.id.toString();
+                // Handle both BigInt and regular number comparison
+                const userId = p.userId;
+                const myId = me.id;
+                
+                // Convert both to strings for reliable comparison
+                const userIdStr = typeof userId === 'bigint' ? userId.toString() : String(userId);
+                const myIdStr = typeof myId === 'bigint' ? myId.toString() : String(myId);
+                
+                return userIdStr === myIdStr;
               });
               
               if (foundParticipant) {
                 myParticipant = foundParticipant;
               }
+            }
+            
+            // If not found in participants array, check selfParticipant as fallback
+            if (!myParticipant && chatFull.fullChat.participants.selfParticipant) {
+              myParticipant = chatFull.fullChat.participants.selfParticipant;
             }
           }
         } catch (rawError) {
@@ -564,9 +650,30 @@ class GroupManager {
         participants = await this.client.getParticipants(groupEntity, {});
         
         if (participants.length > 0) {
-          myParticipant = participants.find(p => p.userId === me.id) ||
-                          participants.find(p => p.id === me.id) ||
-                          participants.find(p => p.user && p.user.id === me.id);
+          myParticipant = participants.find(p => {
+            // Handle multiple possible ID fields and BigInt comparison
+            const myIdStr = typeof me.id === 'bigint' ? me.id.toString() : String(me.id);
+            
+            // Check userId field
+            if (p.userId) {
+              const userIdStr = typeof p.userId === 'bigint' ? p.userId.toString() : String(p.userId);
+              if (userIdStr === myIdStr) return true;
+            }
+            
+            // Check id field
+            if (p.id) {
+              const idStr = typeof p.id === 'bigint' ? p.id.toString() : String(p.id);
+              if (idStr === myIdStr) return true;
+            }
+            
+            // Check user.id field
+            if (p.user && p.user.id) {
+              const userIdStr = typeof p.user.id === 'bigint' ? p.user.id.toString() : String(p.user.id);
+              if (userIdStr === myIdStr) return true;
+            }
+            
+            return false;
+          });
         }
       }
 
@@ -1160,7 +1267,7 @@ class TelegramCleaner {
 
   async displayGroupMembers(groupEntity) {
     try {
-      const participants = await this.groupManager.getParticipants(groupEntity, CONFIG.PARTICIPANTS_LIMIT);
+      const participants = await this.groupManager.getParticipantsWithRoles(groupEntity, CONFIG.PARTICIPANTS_LIMIT);
       
       if (participants.length === 0) {
         console.log(chalk.yellow('👥 No members found in this group.'));
