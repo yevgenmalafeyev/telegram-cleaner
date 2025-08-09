@@ -5,7 +5,9 @@
   "main": "telegram-cleaner.js",
   "type": "module",
   "scripts": {
-    "start": "node telegram-cleaner.js"
+    "start": "node telegram-cleaner.js",
+    "lint": "node -c telegram-cleaner.js",
+    "precheck": "npm run lint"
   },
   "dependencies": {
     "telegram": "^2.25.10",

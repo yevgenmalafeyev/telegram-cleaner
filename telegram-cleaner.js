@@ -693,6 +693,21 @@ class GroupManager {
    * @param {Object} groupEntity - Telegram group entity
    */
   async leaveGroup(groupEntity) {
+    // Delete the chat history FIRST while we still have access
+    try {
+      await this.client.invoke(
+        new Api.messages.DeleteHistory({
+          peer: groupEntity,
+          maxId: 0,
+          justClear: false,
+          revoke: false
+        })
+      );
+    } catch (historyError) {
+      console.warn(chalk.yellow(`⚠️ Could not delete chat history: ${historyError.message}`));
+    }
+
+    // THEN leave the group
     try {
       // Use the high-level client method first (most reliable)
       await this.client.leaveChat(groupEntity);
@@ -727,20 +742,6 @@ class GroupManager {
           throw new Error(`Failed to leave group: ${error.message}. Tried multiple methods.`);
         }
       }
-    }
-
-    // Delete the chat history to make it disappear from chat list
-    try {
-      await this.client.invoke(
-        new Api.messages.DeleteHistory({
-          peer: groupEntity,
-          maxId: 0,
-          justClear: false,
-          revoke: false
-        })
-      );
-    } catch (historyError) {
-      console.warn(chalk.yellow(`⚠️ Could not delete chat history: ${historyError.message}`));
     }
   }
 
@@ -878,6 +879,20 @@ class GroupManager {
 
       // Step 3: Delete the group
       await this.deleteChannelGroup(groupEntity);
+
+      // Step 4: Delete chat history to ensure it disappears from chat list
+      try {
+        await this.client.invoke(
+          new Api.messages.DeleteHistory({
+            peer: groupEntity,
+            maxId: 0,
+            justClear: false,
+            revoke: false
+          })
+        );
+      } catch (historyError) {
+        console.warn(chalk.yellow(`⚠️ Could not delete chat history: ${historyError.message}`));
+      }
     } catch (error) {
       console.error(chalk.red(`❌ Error during group deletion: ${error.message}`));
       throw error;
