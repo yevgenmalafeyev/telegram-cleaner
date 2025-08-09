@@ -707,6 +707,9 @@ class GroupManager {
       console.warn(chalk.yellow(`⚠️ Could not delete chat history: ${historyError.message}`));
     }
 
+    // Wait for server processing to complete
+    await new Promise(resolve => setTimeout(resolve, 1000));
+
     // THEN leave the group
     try {
       // Use the high-level client method first (most reliable)
@@ -879,6 +882,9 @@ class GroupManager {
 
       // Step 3: Delete the group
       await this.deleteChannelGroup(groupEntity);
+
+      // Wait for server processing to complete
+      await new Promise(resolve => setTimeout(resolve, 1000));
 
       // Step 4: Delete chat history to ensure it disappears from chat list
       try {
